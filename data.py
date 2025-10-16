@@ -3,10 +3,7 @@
 Inventory Comparison ETL - Odoo vs Store
 Fetches data from Odoo and Store API, compares inventory, and uploads to BigQuery.
 
-Usage:
-    cd /root/script
-    . .venv/bin/activate
-    python3 data.py
+Standalone version - No app.py needed
 """
 
 import logging
@@ -15,30 +12,193 @@ from datetime import datetime, timezone
 import sys
 import os
 from google.cloud import bigquery
+import xmlrpc.client
+import requests
 
-# Import fetch functions from app
-sys.path.insert(0, os.path.abspath(os.path.dirname(__file__)))
-from app import (
-    CONFIG, 
-    fetch_odoo_data, 
-    fetch_store_data, 
-    compare_inventories,
+# ==============================================================================
+# Configuration - Read from Environment Variables
+# ==============================================================================
+logging.basicConfig(
+    level=logging.INFO, 
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
 
-# ==============================================================================
-# Configuration
-# ==============================================================================
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# Configuration from environment variables
+CONFIG = {
+    "ODOO_URL": os.getenv("ODOO_URL", ""),
+    "ODOO_DB": os.getenv("ODOO_DB", ""),
+    "ODOO_USERNAME": os.getenv("ODOO_USERNAME", ""),
+    "ODOO_PASSWORD": os.getenv("ODOO_PASSWORD", ""),
+    "STORE_API_URL": os.getenv("STORE_API_URL", ""),
+    "STORE_API_KEY": os.getenv("STORE_API_KEY", ""),
+    "BIGQUERY_PROJECT": os.getenv("BIGQUERY_PROJECT", ""),
+    "BIGQUERY_DATASET": os.getenv("BIGQUERY_DATASET", ""),
+    "BIGQUERY_TABLE": os.getenv("BIGQUERY_TABLE", ""),
+}
 
 PROJECT_ID = CONFIG["BIGQUERY_PROJECT"]
 DATASET_ID = CONFIG["BIGQUERY_DATASET"]
 TABLE_ID = CONFIG["BIGQUERY_TABLE"]
 STAGING_TABLE_ID = f"{TABLE_ID}_staging"
-DESTINATION_TABLE = f"{DATASET_ID}.{TABLE_ID}"
-STAGING_DESTINATION_TABLE = f"{DATASET_ID}.{STAGING_TABLE_ID}"
 
 # ==============================================================================
-# Main ETL Functions
+# Data Fetching Functions
+# ==============================================================================
+
+def fetch_odoo_data():
+    """
+    Fetch product inventory data from Odoo.
+    Returns: List of dictionaries with product data
+    """
+    logging.info(f"Connecting to Odoo: {CONFIG['ODOO_URL']}")
+    
+    try:
+        # Odoo XML-RPC setup
+        common = xmlrpc.client.ServerProxy(f"{CONFIG['ODOO_URL']}/xmlrpc/2/common")
+        uid = common.authenticate(
+            CONFIG['ODOO_DB'], 
+            CONFIG['ODOO_USERNAME'], 
+            CONFIG['ODOO_PASSWORD'], 
+            {}
+        )
+        
+        if not uid:
+            raise Exception("Failed to authenticate with Odoo")
+        
+        models = xmlrpc.client.ServerProxy(f"{CONFIG['ODOO_URL']}/xmlrpc/2/object")
+        
+        # Fetch products with barcodes
+        products = models.execute_kw(
+            CONFIG['ODOO_DB'], 
+            uid, 
+            CONFIG['ODOO_PASSWORD'],
+            'product.product', 
+            'search_read',
+            [[['barcode', '!=', False]]],
+            {
+                'fields': ['barcode', 'name', 'qty_available'],
+                'limit': None
+            }
+        )
+        
+        # Transform to standard format
+        odoo_data = []
+        for product in products:
+            odoo_data.append({
+                'barcode': product.get('barcode', ''),
+                'name': product.get('name', ''),
+                'qty': product.get('qty_available', 0)
+            })
+        
+        logging.info(f"Fetched {len(odoo_data)} products from Odoo")
+        return odoo_data
+        
+    except Exception as e:
+        logging.error(f"Error fetching Odoo data: {e}")
+        raise
+
+
+def fetch_store_data():
+    """
+    Fetch product inventory data from Store API.
+    Returns: List of dictionaries with product data
+    """
+    logging.info(f"Connecting to Store API: {CONFIG['STORE_API_URL']}")
+    
+    try:
+        headers = {
+            "Authorization": f"Bearer {CONFIG['STORE_API_KEY']}",
+            "Content-Type": "application/json"
+        }
+        
+        # Adjust endpoint based on your API
+        response = requests.get(
+            f"{CONFIG['STORE_API_URL']}/products",
+            headers=headers,
+            timeout=30
+        )
+        response.raise_for_status()
+        
+        data = response.json()
+        
+        # Transform to standard format
+        store_data = []
+        products = data.get('products', data)
+        
+        for product in products:
+            store_data.append({
+                'barcode': product.get('barcode', ''),
+                'name': product.get('name', ''),
+                'qty': product.get('quantity', 0),
+                'id': product.get('id', '')
+            })
+        
+        logging.info(f"Fetched {len(store_data)} products from Store API")
+        return store_data
+        
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching Store data: {e}")
+        raise
+
+
+def compare_inventories(odoo_data, store_data):
+    """
+    Compare inventory data from Odoo and Store.
+    Returns: List of comparison results
+    """
+    # Create lookup dictionary for store data
+    store_dict = {item['barcode']: item for item in store_data if item.get('barcode')}
+    
+    comparison_results = []
+    
+    for odoo_item in odoo_data:
+        barcode = odoo_item['barcode']
+        odoo_qty = odoo_item['qty']
+        odoo_name = odoo_item['name']
+        
+        # Check if product exists in store
+        if barcode in store_dict:
+            store_item = store_dict[barcode]
+            store_qty = store_item['qty']
+            store_name = store_item['name']
+            store_id = store_item['id']
+            
+            # Compare quantities
+            if odoo_qty == store_qty:
+                status = "MATCH"
+                difference = "0"
+            else:
+                status = "MISMATCH"
+                difference = str(odoo_qty - store_qty)
+            
+            comparison_results.append({
+                "barcode": barcode,
+                "odoo_name": odoo_name,
+                "odoo_qty": odoo_qty,
+                "store_name": store_name,
+                "store_qty": store_qty,
+                "store_id": store_id,
+                "status": status,
+                "difference": difference
+            })
+        else:
+            # Product not found in store
+            comparison_results.append({
+                "barcode": barcode,
+                "odoo_name": odoo_name,
+                "odoo_qty": odoo_qty,
+                "store_name": "N/A",
+                "store_qty": "N/A",
+                "store_id": "N/A",
+                "status": "NOT FOUND IN STORE",
+                "difference": "N/A"
+            })
+    
+    return comparison_results
+
+# ==============================================================================
+# ETL Functions
 # ==============================================================================
 
 def get_comparison_dataframe():
@@ -95,12 +255,13 @@ def get_comparison_dataframe():
     
     # Ensure correct dtypes
     df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['odoo_qty'] = df['odoo_qty'].astype('Int64')  # Nullable integer
+    df['odoo_qty'] = df['odoo_qty'].astype('Int64')
     df['store_qty'] = df['store_qty'].astype('Int64')
     
     total_time = time.time() - start_time
     logging.info(f"✅ DataFrame created with {len(df)} rows in {total_time:.2f}s total")
     return df
+
 
 def load_dataframe(df, project_id, dataset_id, table_id, write_disposition):
     """Load a DataFrame into BigQuery with the provided write disposition."""
@@ -108,12 +269,10 @@ def load_dataframe(df, project_id, dataset_id, table_id, write_disposition):
     table_ref = f"{project_id}.{dataset_id}.{table_id}"
     job_config = bigquery.LoadJobConfig(write_disposition=write_disposition)
 
-    logging.info(
-        f"Loading {len(df)} rows into {table_ref} with disposition {write_disposition}..."
-    )
+    logging.info(f"Loading {len(df)} rows into {table_ref} with disposition {write_disposition}...")
     try:
         load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
-        load_job.result()  # Wait for job completion
+        load_job.result()
         logging.info(f"✅ Successfully wrote {len(df)} rows to {table_ref}")
     except Exception as exc:
         logging.error(f"❌ Error loading data into {table_ref}: {exc}")
@@ -134,18 +293,19 @@ def upload_to_main_table(df, project_id):
         write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
     )
 
+
 def create_staging_snapshot(df, project_id):
     """Create a snapshot in staging table with run_date."""
     if df.empty:
         logging.warning("DataFrame is empty. Skipping staging snapshot.")
         return
     
-    # Add run_date column (today's date in UTC)
+    # Add run_date column
     run_date = datetime.now(timezone.utc).date()
     df_staging = df.copy()
     df_staging['run_date'] = run_date
     
-    # Reorder columns to match staging schema
+    # Reorder columns
     columns_order = [
         'run_date', 'timestamp', 'barcode', 'odoo_name', 'odoo_qty',
         'store_name', 'store_qty', 'store_id', 'status', 'difference'
@@ -175,26 +335,26 @@ def create_staging_snapshot(df, project_id):
 
 if __name__ == "__main__":
     if not PROJECT_ID:
-        logging.error("BIGQUERY_PROJECT is not configured. Please check CONFIG in app.py")
+        logging.error("BIGQUERY_PROJECT is not configured. Please check environment variables")
         sys.exit(1)
     
     try:
-        # Step 1: Get comparison data as DataFrame
+        # Get comparison data as DataFrame
         comparison_df = get_comparison_dataframe()
         
         if comparison_df.empty:
             logging.warning("No data to upload. Exiting.")
             sys.exit(0)
         
-        # Step 2: Upload to main table
+        # Upload to main table
         upload_to_main_table(comparison_df, PROJECT_ID)
         
-        # Step 3: Create staging snapshot
+        # Create staging snapshot
         create_staging_snapshot(comparison_df, PROJECT_ID)
         
         logging.info("=== ✅ ETL Process Completed Successfully ===")
         
-        # Print summary statistics
+        # Print summary
         matches = len(comparison_df[comparison_df['status'].str.contains('MATCH', na=False)])
         mismatches = len(comparison_df[comparison_df['status'].str.contains('MISMATCH', na=False)])
         not_found = len(comparison_df[comparison_df['status'].str.contains('NOT FOUND', na=False)])
