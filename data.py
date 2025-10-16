@@ -1,448 +1,322 @@
-# -*- coding: utf-8 -*-
-"""
-Inventory Comparison ETL - Odoo vs Store
-Fetches data from Odoo and Store API, compares inventory, and uploads to BigQuery.
+"""Standalone ETL script for running inventory comparison in CI/CD.
 
-Standalone version - No app.py needed
+Reads configuration from environment variables so it can be executed inside
+GitHub Actions or any other automation environment without depending on the
+Flask app configuration module.
 """
 
+from __future__ import annotations
+
+import json
 import logging
-import pandas as pd
-from datetime import datetime, timezone
-import sys
 import os
-from google.cloud import bigquery
-import xmlrpc.client
-import requests
+import sys
+import time
+from datetime import datetime, timezone
+from typing import Dict, List
 
-# ==============================================================================
-# Configuration - Read from Environment Variables
-# ==============================================================================
+import pandas as pd
+import requests
+from google.cloud import bigquery
+
+
 logging.basicConfig(
-    level=logging.INFO, 
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[logging.StreamHandler(sys.stdout)]
+    level=logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
 )
 
-# Configuration from environment variables
-CONFIG = {
-    "ODOO_URL": os.getenv("ODOO_URL", ""),
-    "ODOO_DB": os.getenv("ODOO_DB", ""),
-    "ODOO_USERNAME": os.getenv("ODOO_USERNAME", ""),
-    "ODOO_PASSWORD": os.getenv("ODOO_PASSWORD", ""),
-    "STORE_API_URL": os.getenv("STORE_API_URL", ""),
-    "STORE_API_KEY": os.getenv("STORE_API_KEY", ""),
-    "BIGQUERY_PROJECT": os.getenv("BIGQUERY_PROJECT", ""),
-    "BIGQUERY_DATASET": os.getenv("BIGQUERY_DATASET", ""),
-    "BIGQUERY_TABLE": os.getenv("BIGQUERY_TABLE", ""),
-}
 
-PROJECT_ID = CONFIG["BIGQUERY_PROJECT"]
-DATASET_ID = CONFIG["BIGQUERY_DATASET"]
-TABLE_ID = CONFIG["BIGQUERY_TABLE"]
-STAGING_TABLE_ID = f"{TABLE_ID}_staging"
-
-# ==============================================================================
-# Data Fetching Functions
-# ==============================================================================
-
-def fetch_odoo_data():
-    """
-    Fetch product inventory data from Odoo.
-    Returns: List of dictionaries with product data
-    """
-    logging.info(f"Connecting to Odoo: {CONFIG['ODOO_URL']}")
-    logging.info(f"Database: {CONFIG['ODOO_DB']}")
-    logging.info(f"Username: {CONFIG['ODOO_USERNAME']}")
-    
+def _load_env_int(name: str, default: int) -> int:
+    """Read an integer from environment variables with fallback."""
+    raw = os.getenv(name)
+    if raw is None:
+        return default
     try:
-        # Odoo XML-RPC setup
-        common_url = f"{CONFIG['ODOO_URL']}/xmlrpc/2/common"
-        logging.info(f"Common URL: {common_url}")
-        common = xmlrpc.client.ServerProxy(common_url)
-        
-        # Try to get version first (to test connection)
-        try:
-            version_info = common.version()
-            logging.info(f"Odoo version info: {version_info}")
-        except Exception as ve:
-            logging.error(f"Failed to connect to Odoo: {ve}")
-            raise
-        
-        logging.info("Attempting authentication...")
-        uid = common.authenticate(
-            CONFIG['ODOO_DB'], 
-            CONFIG['ODOO_USERNAME'], 
-            CONFIG['ODOO_PASSWORD'], 
-            {}
-        )
-        
-        logging.info(f"Authentication result - UID: {uid}")
-        
-        if not uid:
-            raise Exception(
-                f"Authentication failed!\n"
-                f"Database: {CONFIG['ODOO_DB']}\n"
-                f"Username: {CONFIG['ODOO_USERNAME']}\n"
-                f"Please check:\n"
-                f"1. Database name is correct\n"
-                f"2. Username and password are correct\n"
-                f"3. User has API access enabled\n"
-                f"4. Odoo instance allows external API access"
-            )
-        
-        models = xmlrpc.client.ServerProxy(f"{CONFIG['ODOO_URL']}/xmlrpc/2/object")
-        
-        # Fetch products with barcodes
-        products = models.execute_kw(
-            CONFIG['ODOO_DB'], 
-            uid, 
-            CONFIG['ODOO_PASSWORD'],
-            'product.product', 
-            'search_read',
-            [[['barcode', '!=', False]]],
-            {
-                'fields': ['barcode', 'name', 'qty_available']
-                # Removed 'limit': None - XML-RPC doesn't accept None values
-            }
-        )
-        
-        # Transform to standard format
-        odoo_data = []
-        for product in products:
-            odoo_data.append({
-                'barcode': product.get('barcode', ''),
-                'name': product.get('name', ''),
-                'qty': product.get('qty_available', 0)
-            })
-        
-        logging.info(f"Fetched {len(odoo_data)} products from Odoo")
-        return odoo_data
-        
-    except Exception as e:
-        logging.error(f"Error fetching Odoo data: {e}")
-        raise
+        return int(raw)
+    except ValueError:
+        logging.warning("Invalid integer for %s=%s, using default %s", name, raw, default)
+        return default
 
 
-def fetch_store_data():
-    """
-    Fetch product inventory data from Store API.
-    Returns: List of dictionaries with product data
-    """
-    logging.info(f"Connecting to Store API: {CONFIG['STORE_API_URL']}")
-    
-    try:
-        # Try different authentication methods based on API type
-        
-        # Method 1: Token in custom header (most common for custom APIs)
-        headers = {
-            "token": CONFIG['STORE_API_KEY'],
-            "Content-Type": "application/json",
-            "Accept": "application/json"
+def _require_env(name: str) -> str:
+    """Return a mandatory environment variable or exit with clear message."""
+    value = os.getenv(name)
+    if not value:
+        logging.critical("Missing required environment variable: %s", name)
+        sys.exit(1)
+    return value
+
+
+class InventoryETL:
+    """Encapsulates inventory comparison logic."""
+
+    def __init__(self) -> None:
+        self.odoo_url = _require_env("ODOO_URL").rstrip("/")
+        self.odoo_db = _require_env("ODOO_DB")
+        self.odoo_username = _require_env("ODOO_USERNAME")
+        self.odoo_password = _require_env("ODOO_PASSWORD")
+        self.store_api_url = _require_env("STORE_API_URL").rstrip("/")
+        self.store_api_token = _require_env("STORE_API_TOKEN")
+        self.bigquery_project = _require_env("BIGQUERY_PROJECT")
+        self.dataset_id = _require_env("BIGQUERY_DATASET")
+        self.table_id = _require_env("BIGQUERY_TABLE")
+        self.staging_table_id = f"{self.table_id}_staging"
+        self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
+        self.store_batch = _load_env_int("STORE_BATCH", 200)
+
+    # ------------------------------------------------------------------ Odoo --
+    def _get_odoo_session(self) -> Dict:
+        auth_url = f"{self.odoo_url}/web/session/authenticate"
+        payload = {
+            "jsonrpc": "2.0",
+            "params": {
+                "db": self.odoo_db,
+                "login": self.odoo_username,
+                "password": self.odoo_password,
+            },
         }
-        
-        # Build the URL with token as query parameter
-        api_url = f"{CONFIG['STORE_API_URL']}/products?token={CONFIG['STORE_API_KEY']}"
-        logging.info(f"Requesting: {api_url.replace(CONFIG['STORE_API_KEY'], '***TOKEN***')}")
-        logging.info(f"Using authentication with token header")
-        
-        # Make request
-        response = requests.get(
-            api_url,
-            headers=headers,
-            timeout=60
-        )
-        
-        # Log response details
-        logging.info(f"Response status: {response.status_code}")
-        
-        if response.status_code != 200:
-            logging.error(f"Response body: {response.text[:1000]}")
-            
-            # If first method fails, try alternative methods
-            if response.status_code == 400 or response.status_code == 401:
-                logging.info("Trying alternative authentication: Bearer token")
-                
-                # Method 2: Bearer token
-                headers_alt = {
-                    "Authorization": f"Bearer {CONFIG['STORE_API_KEY']}",
-                    "Content-Type": "application/json",
-                    "Accept": "application/json"
-                }
-                
-                response = requests.get(api_url, headers=headers_alt, timeout=60)
-                logging.info(f"Alternative auth response status: {response.status_code}")
-                
-                if response.status_code != 200:
-                    logging.error(f"Alternative auth response: {response.text[:1000]}")
-        
+        response = requests.post(auth_url, json=payload, timeout=60)
         response.raise_for_status()
-        
         data = response.json()
-        logging.info(f"Response structure keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
-        
-        # Transform to standard format
-        store_data = []
-        
-        # Handle different response formats
-        if isinstance(data, dict):
-            if 'data' in data:
-                products = data['data']
-            elif 'products' in data:
-                products = data['products']
-            elif 'items' in data:
-                products = data['items']
-            else:
-                products = data
-        else:
-            products = data
-        
-        logging.info(f"Found {len(products) if isinstance(products, list) else 0} products in response")
-        
-        # Log structure for debugging
-        if products and len(products) > 0 and isinstance(products, list):
-            logging.info(f"Sample product keys: {list(products[0].keys()) if isinstance(products[0], dict) else 'Not a dict'}")
-        
-        for product in products if isinstance(products, list) else []:
-            if isinstance(product, dict):
-                store_data.append({
-                    'barcode': product.get('barcode', product.get('sku', '')),
-                    'name': product.get('name', product.get('product_name', '')),
-                    'qty': product.get('quantity', product.get('qty', product.get('stock', 0))),
-                    'id': str(product.get('id', product.get('product_id', '')))
-                })
-        
-        logging.info(f"Fetched {len(store_data)} products from Store API")
-        return store_data
-        
-    except requests.exceptions.RequestException as e:
-        logging.error(f"Error fetching Store data: {e}")
-        raise
+        result = data.get("result", {})
+        if not result.get("uid"):
+            raise RuntimeError("Odoo authentication failed; no UID returned.")
+        return response.cookies.get_dict()
 
+    def fetch_odoo_data(self) -> List[Dict]:
+        session = self._get_odoo_session()
+        offset = 0
+        all_products: List[Dict] = []
 
-def compare_inventories(odoo_data, store_data):
-    """
-    Compare inventory data from Odoo and Store.
-    Returns: List of comparison results
-    """
-    # Create lookup dictionary for store data
-    store_dict = {item['barcode']: item for item in store_data if item.get('barcode')}
-    
-    comparison_results = []
-    
-    for odoo_item in odoo_data:
-        barcode = odoo_item['barcode']
-        odoo_qty = odoo_item['qty']
-        odoo_name = odoo_item['name']
-        
-        # Check if product exists in store
-        if barcode in store_dict:
-            store_item = store_dict[barcode]
-            store_qty = store_item['qty']
-            store_name = store_item['name']
-            store_id = store_item['id']
-            
-            # Compare quantities
-            if odoo_qty == store_qty:
-                status = "MATCH"
-                difference = "0"
+        while True:
+            payload = {
+                "jsonrpc": "2.0",
+                "method": "call",
+                "params": {
+                    "model": "product.product",
+                    "method": "search_read",
+                    "args": [[
+                        ["type", "=", "product"],
+                        ["barcode", "!=", False],
+                        ["barcode", "!=", ""],
+                    ]],
+                    "kwargs": {
+                        "fields": ["id", "display_name", "barcode"],
+                        "limit": self.odoo_batch,
+                        "offset": offset,
+                    },
+                },
+            }
+            rpc_url = f"{self.odoo_url}/web/dataset/call_kw"
+            response = requests.post(rpc_url, json=payload, cookies=session, timeout=60)
+            response.raise_for_status()
+            batch = response.json().get("result", [])
+            if not batch:
+                break
+            all_products.extend(batch)
+            offset += self.odoo_batch
+
+        # Fetch stock quantities
+        stock_payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": "stock.quant",
+                "method": "search_read",
+                "args": [[["location_id.usage", "=", "internal"]]],
+                "kwargs": {
+                    "fields": ["product_id", "quantity", "reserved_quantity"],
+                    "limit": 0,
+                },
+            },
+        }
+        rpc_url = f"{self.odoo_url}/web/dataset/call_kw"
+        response = requests.post(rpc_url, json=stock_payload, cookies=session, timeout=60)
+        response.raise_for_status()
+        stock_quants = response.json().get("result", [])
+
+        stock_map: Dict[int, Dict[str, float]] = {}
+        for quant in stock_quants:
+            product = quant.get("product_id")
+            if isinstance(product, list):
+                product_id = product[0]
             else:
-                status = "MISMATCH"
-                difference = str(odoo_qty - store_qty)
-            
-            comparison_results.append({
+                product_id = product
+            entry = stock_map.setdefault(product_id, {"onHand": 0.0, "reserved": 0.0})
+            entry["onHand"] += quant.get("quantity", 0.0)
+            entry["reserved"] += quant.get("reserved_quantity", 0.0)
+
+        results: List[Dict] = []
+        for product in all_products:
+            product_id = product.get("id")
+            stock_info = stock_map.get(product_id, {"onHand": 0.0, "reserved": 0.0})
+            available = max(stock_info["onHand"] - stock_info["reserved"], 0.0)
+            results.append({
+                "barcode": product.get("barcode", ""),
+                "name": product.get("display_name", ""),
+                "quantity": int(available),
+            })
+
+        logging.info("Fetched %s products from Odoo", len(results))
+        return results
+
+    # ---------------------------------------------------------------- Store --
+    def fetch_store_data(self) -> List[Dict]:
+        page = 1
+        all_products: List[Dict] = []
+
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {self.store_api_token}",
+        }
+
+        while True:
+            url = f"{self.store_api_url}/products/limit/{self.store_batch}/page/{page}"
+            response = requests.get(url, headers=headers, timeout=60)
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("success") != 1:
+                break
+            data = payload.get("data") or []
+            if not data:
+                break
+            all_products.extend(data)
+            page += 1
+
+        logging.info("Fetched %s products from Store API", len(all_products))
+        normalized: List[Dict] = []
+        for product in all_products:
+            barcode = product.get("upc")
+            name = None
+            description = product.get("product_description")
+            if isinstance(description, list) and description:
+                name = description[0].get("name")
+            normalized.append({
+                "barcode": str(barcode).strip() if barcode else "",
+                "name": name or "",
+                "quantity": product.get("quantity", 0),
+                "id": product.get("id", ""),
+            })
+        return normalized
+
+    # ------------------------------------------------------------- Compare --
+    @staticmethod
+    def compare_inventories(odoo_products: List[Dict], store_products: List[Dict]) -> List[Dict]:
+        store_map = {item["barcode"]: item for item in store_products if item.get("barcode")}
+        comparison: List[Dict] = []
+
+        for odoo_product in odoo_products:
+            barcode = odoo_product.get("barcode")
+            if not barcode:
+                continue
+            store_product = store_map.get(barcode)
+            odoo_qty = odoo_product.get("quantity", 0)
+            store_qty = store_product.get("quantity", 0) if store_product else None
+
+            record = {
                 "barcode": barcode,
-                "odoo_name": odoo_name,
+                "odoo_name": odoo_product.get("name", ""),
                 "odoo_qty": odoo_qty,
-                "store_name": store_name,
+                "store_name": store_product.get("name") if store_product else None,
                 "store_qty": store_qty,
-                "store_id": store_id,
-                "status": status,
-                "difference": difference
-            })
-        else:
-            # Product not found in store
-            comparison_results.append({
-                "barcode": barcode,
-                "odoo_name": odoo_name,
-                "odoo_qty": odoo_qty,
-                "store_name": "N/A",
-                "store_qty": "N/A",
-                "store_id": "N/A",
-                "status": "NOT FOUND IN STORE",
-                "difference": "N/A"
-            })
-    
-    return comparison_results
+                "store_id": store_product.get("id") if store_product else None,
+            }
 
-# ==============================================================================
-# ETL Functions
-# ==============================================================================
+            if store_product is None:
+                record.update({
+                    "status": "❌ NOT FOUND IN STORE",
+                    "difference": "N/A",
+                })
+            elif odoo_qty == store_qty:
+                record.update({
+                    "status": "✅ MATCH",
+                    "difference": 0,
+                })
+            else:
+                record.update({
+                    "status": "⚠ QUANTITY MISMATCH",
+                    "difference": odoo_qty - store_qty,
+                })
 
-def get_comparison_dataframe():
-    """Fetch data from Odoo and Store, compare, and return DataFrame."""
-    import time
-    start_time = time.time()
-    
-    logging.info("=== Starting Inventory Comparison ETL ===")
-    
-    # Step 1: Fetch Odoo data
-    logging.info("Step 1: Fetching data from Odoo...")
-    step_start = time.time()
-    odoo_data = fetch_odoo_data()
-    odoo_time = time.time() - step_start
-    logging.info(f"✅ Fetched {len(odoo_data)} products from Odoo in {odoo_time:.2f}s")
-    
-    # Step 2: Fetch Store data
-    logging.info("Step 2: Fetching data from Store API...")
-    step_start = time.time()
-    store_data = fetch_store_data()
-    store_time = time.time() - step_start
-    logging.info(f"✅ Fetched {len(store_data)} products from Store in {store_time:.2f}s")
-    
-    # Step 3: Compare inventories
-    logging.info("Step 3: Comparing inventories...")
-    step_start = time.time()
-    comparison_results = compare_inventories(odoo_data, store_data)
-    compare_time = time.time() - step_start
-    logging.info(f"✅ Comparison complete: {len(comparison_results)} total records in {compare_time:.2f}s")
-    
-    # Step 4: Convert to DataFrame
-    if not comparison_results:
-        logging.warning("No comparison results to upload.")
-        return pd.DataFrame()
-    
-    # Add timestamp
-    timestamp = datetime.now(timezone.utc)
-    
-    df_data = []
-    for row in comparison_results:
-        df_data.append({
-            "timestamp": timestamp,
-            "barcode": row["barcode"],
-            "odoo_name": row["odoo_name"],
-            "odoo_qty": int(row["odoo_qty"]) if row["odoo_qty"] is not None else None,
-            "store_name": row["store_name"] if row["store_name"] != "N/A" else None,
-            "store_qty": int(row["store_qty"]) if isinstance(row["store_qty"], (int, float)) else None,
-            "store_id": row["store_id"] if row["store_id"] != "N/A" else None,
-            "status": row["status"],
-            "difference": str(row["difference"]),
-        })
-    
-    df = pd.DataFrame(df_data)
-    
-    # Ensure correct dtypes
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
-    df['odoo_qty'] = df['odoo_qty'].astype('Int64')
-    df['store_qty'] = df['store_qty'].astype('Int64')
-    
-    total_time = time.time() - start_time
-    logging.info(f"✅ DataFrame created with {len(df)} rows in {total_time:.2f}s total")
-    return df
+            comparison.append(record)
 
+        logging.info("Compared %s products", len(comparison))
+        return comparison
 
-def load_dataframe(df, project_id, dataset_id, table_id, write_disposition):
-    """Load a DataFrame into BigQuery with the provided write disposition."""
-    client = bigquery.Client(project=project_id)
-    table_ref = f"{project_id}.{dataset_id}.{table_id}"
-    job_config = bigquery.LoadJobConfig(write_disposition=write_disposition)
-
-    logging.info(f"Loading {len(df)} rows into {table_ref} with disposition {write_disposition}...")
-    try:
+    # -------------------------------------------------------------- BigQuery --
+    def load_dataframe(self, df: pd.DataFrame, table: str, disposition: str) -> None:
+        client = bigquery.Client(project=self.bigquery_project)
+        table_ref = f"{self.bigquery_project}.{self.dataset_id}.{table}"
+        job_config = bigquery.LoadJobConfig(write_disposition=disposition)
+        logging.info("Loading %s rows into %s", len(df), table_ref)
         load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
         load_job.result()
-        logging.info(f"✅ Successfully wrote {len(df)} rows to {table_ref}")
-    except Exception as exc:
-        logging.error(f"❌ Error loading data into {table_ref}: {exc}")
-        raise
+        logging.info("Load complete: %s", table_ref)
 
+    # ---------------------------------------------------------------- Public --
+    def run(self) -> None:
+        start = time.time()
+        logging.info("=== Starting Inventory ETL ===")
 
-def upload_to_main_table(df, project_id):
-    """Replace main BigQuery table contents with the provided DataFrame."""
-    if df.empty:
-        logging.warning("DataFrame is empty. Skipping upload to main table.")
-        return
+        odoo_data = self.fetch_odoo_data()
+        store_data = self.fetch_store_data()
+        comparison = self.compare_inventories(odoo_data, store_data)
 
-    load_dataframe(
-        df=df,
-        project_id=project_id,
-        dataset_id=DATASET_ID,
-        table_id=TABLE_ID,
-        write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-    )
+        if not comparison:
+            logging.warning("No comparison data produced; exiting.")
+            return
 
+        timestamp = datetime.now(timezone.utc)
+        rows = []
+        for item in comparison:
+            rows.append({
+                "timestamp": timestamp,
+                "barcode": item.get("barcode"),
+                "odoo_name": item.get("odoo_name"),
+                "odoo_qty": item.get("odoo_qty"),
+                "store_name": item.get("store_name"),
+                "store_qty": item.get("store_qty"),
+                "store_id": item.get("store_id"),
+                "status": item.get("status"),
+                "difference": str(item.get("difference")),
+            })
 
-def create_staging_snapshot(df, project_id):
-    """Create a snapshot in staging table with run_date."""
-    if df.empty:
-        logging.warning("DataFrame is empty. Skipping staging snapshot.")
-        return
-    
-    # Add run_date column
-    run_date = datetime.now(timezone.utc).date()
-    df_staging = df.copy()
-    df_staging['run_date'] = run_date
-    
-    # Reorder columns
-    columns_order = [
-        'run_date', 'timestamp', 'barcode', 'odoo_name', 'odoo_qty',
-        'store_name', 'store_qty', 'store_id', 'status', 'difference'
-    ]
-    df_staging = df_staging[columns_order]
-    
-    import time
-    logging.info(f"Creating staging snapshot for {run_date} with {len(df_staging)} rows...")
-    staging_start = time.time()
-    try:
-        load_dataframe(
-            df=df_staging,
-            project_id=project_id,
-            dataset_id=DATASET_ID,
-            table_id=STAGING_TABLE_ID,
-            write_disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        df = pd.DataFrame(rows)
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+        df["odoo_qty"] = pd.to_numeric(df["odoo_qty"], errors="coerce").astype("Int64")
+        df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce").astype("Int64")
+
+        # Upload main table and staging snapshot
+        self.load_dataframe(
+            df,
+            table=self.table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
         )
-        staging_time = time.time() - staging_start
-        logging.info(f"✅ Staging snapshot created for {run_date} in {staging_time:.2f}s")
-    except Exception as e:
-        logging.error(f"❌ Error creating staging snapshot: {e}")
-        raise
 
-# ==============================================================================
-# Main Execution
-# ==============================================================================
+        staging_df = df.copy()
+        staging_df.insert(0, "run_date", timestamp.date())
+        self.load_dataframe(
+            staging_df,
+            table=self.staging_table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+
+        elapsed = time.time() - start
+        logging.info("=== ETL completed in %.2fs ===", elapsed)
+
+
+def main() -> None:
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        logging.critical("GOOGLE_APPLICATION_CREDENTIALS must point to a service account key file.")
+        sys.exit(1)
+
+    etl = InventoryETL()
+    etl.run()
+
 
 if __name__ == "__main__":
-    if not PROJECT_ID:
-        logging.error("BIGQUERY_PROJECT is not configured. Please check environment variables")
-        sys.exit(1)
-    
     try:
-        # Get comparison data as DataFrame
-        comparison_df = get_comparison_dataframe()
-        
-        if comparison_df.empty:
-            logging.warning("No data to upload. Exiting.")
-            sys.exit(0)
-        
-        # Upload to main table
-        upload_to_main_table(comparison_df, PROJECT_ID)
-        
-        # Create staging snapshot
-        create_staging_snapshot(comparison_df, PROJECT_ID)
-        
-        logging.info("=== ✅ ETL Process Completed Successfully ===")
-        
-        # Print summary
-        matches = len(comparison_df[comparison_df['status'].str.contains('MATCH', na=False)])
-        mismatches = len(comparison_df[comparison_df['status'].str.contains('MISMATCH', na=False)])
-        not_found = len(comparison_df[comparison_df['status'].str.contains('NOT FOUND', na=False)])
-        
-        logging.info(f"Summary:")
-        logging.info(f"  - Total records: {len(comparison_df)}")
-        logging.info(f"  - Matches: {matches}")
-        logging.info(f"  - Mismatches: {mismatches}")
-        logging.info(f"  - Not Found: {not_found}")
-        
-    except Exception as e:
-        logging.critical("=== ❌ ETL Process Failed ===", exc_info=True)
+        main()
+    except Exception:
+        logging.exception("ETL process failed")
         sys.exit(1)
