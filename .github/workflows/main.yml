@@ -36,7 +36,7 @@ jobs:
           ODOO_USERNAME: ${{ vars.ODOO_USERNAME }}
           ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD }}
           STORE_API_URL: ${{ vars.STORE_API_URL }}
-          STORE_API_KEY: ${{ vars.STORE_API_TOKEN }}
+          STORE_API_KEY: ${{ vars.STORE_API_KEY }}
           BIGQUERY_PROJECT: ${{ vars.BIGQUERY_PROJECT }}
           BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET }}
           BIGQUERY_TABLE: ${{ vars.BIGQUERY_TABLE }}
