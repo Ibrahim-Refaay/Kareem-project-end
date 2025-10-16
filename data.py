@@ -134,29 +134,46 @@ def fetch_store_data():
     try:
         headers = {
             "Authorization": f"Bearer {CONFIG['STORE_API_KEY']}",
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
+            "Accept": "application/json"
         }
         
-        # Adjust endpoint based on your API
+        # Build the URL
+        api_url = f"{CONFIG['STORE_API_URL']}/products"
+        logging.info(f"Requesting: {api_url}")
+        
+        # Make request
         response = requests.get(
-            f"{CONFIG['STORE_API_URL']}/products",
+            api_url,
             headers=headers,
             timeout=30
         )
+        
+        # Log response details before raising error
+        logging.info(f"Response status: {response.status_code}")
+        
+        if response.status_code != 200:
+            logging.error(f"Response headers: {dict(response.headers)}")
+            logging.error(f"Response body: {response.text[:500]}")  # First 500 chars
+        
         response.raise_for_status()
         
         data = response.json()
         
         # Transform to standard format
         store_data = []
-        products = data.get('products', data)
+        products = data.get('products', data)  # Handle both formats
+        
+        # Log structure for debugging
+        if products and len(products) > 0:
+            logging.info(f"Sample product structure: {list(products[0].keys()) if isinstance(products[0], dict) else 'Not a dict'}")
         
         for product in products:
             store_data.append({
                 'barcode': product.get('barcode', ''),
                 'name': product.get('name', ''),
-                'qty': product.get('quantity', 0),
-                'id': product.get('id', '')
+                'qty': product.get('quantity', product.get('qty', 0)),
+                'id': product.get('id', product.get('product_id', ''))
             })
         
         logging.info(f"Fetched {len(store_data)} products from Store API")
