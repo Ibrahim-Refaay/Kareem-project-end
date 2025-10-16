@@ -102,8 +102,8 @@ def fetch_odoo_data():
             'search_read',
             [[['barcode', '!=', False]]],
             {
-                'fields': ['barcode', 'name', 'qty_available'],
-                'limit': None
+                'fields': ['barcode', 'name', 'qty_available']
+                # Removed 'limit': None - XML-RPC doesn't accept None values
             }
         )
         
