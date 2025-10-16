@@ -132,49 +132,85 @@ def fetch_store_data():
     logging.info(f"Connecting to Store API: {CONFIG['STORE_API_URL']}")
     
     try:
+        # Try different authentication methods based on API type
+        
+        # Method 1: Token in custom header (most common for custom APIs)
         headers = {
-            "Authorization": f"Bearer {CONFIG['STORE_API_KEY']}",
+            "token": CONFIG['STORE_API_KEY'],
             "Content-Type": "application/json",
             "Accept": "application/json"
         }
         
-        # Build the URL
-        api_url = f"{CONFIG['STORE_API_URL']}/products"
-        logging.info(f"Requesting: {api_url}")
+        # Build the URL with token as query parameter
+        api_url = f"{CONFIG['STORE_API_URL']}/products?token={CONFIG['STORE_API_KEY']}"
+        logging.info(f"Requesting: {api_url.replace(CONFIG['STORE_API_KEY'], '***TOKEN***')}")
+        logging.info(f"Using authentication with token header")
         
         # Make request
         response = requests.get(
             api_url,
             headers=headers,
-            timeout=30
+            timeout=60
         )
         
-        # Log response details before raising error
+        # Log response details
         logging.info(f"Response status: {response.status_code}")
         
         if response.status_code != 200:
-            logging.error(f"Response headers: {dict(response.headers)}")
-            logging.error(f"Response body: {response.text[:500]}")  # First 500 chars
+            logging.error(f"Response body: {response.text[:1000]}")
+            
+            # If first method fails, try alternative methods
+            if response.status_code == 400 or response.status_code == 401:
+                logging.info("Trying alternative authentication: Bearer token")
+                
+                # Method 2: Bearer token
+                headers_alt = {
+                    "Authorization": f"Bearer {CONFIG['STORE_API_KEY']}",
+                    "Content-Type": "application/json",
+                    "Accept": "application/json"
+                }
+                
+                response = requests.get(api_url, headers=headers_alt, timeout=60)
+                logging.info(f"Alternative auth response status: {response.status_code}")
+                
+                if response.status_code != 200:
+                    logging.error(f"Alternative auth response: {response.text[:1000]}")
         
         response.raise_for_status()
         
         data = response.json()
+        logging.info(f"Response structure keys: {list(data.keys()) if isinstance(data, dict) else 'Not a dict'}")
         
         # Transform to standard format
         store_data = []
-        products = data.get('products', data)  # Handle both formats
+        
+        # Handle different response formats
+        if isinstance(data, dict):
+            if 'data' in data:
+                products = data['data']
+            elif 'products' in data:
+                products = data['products']
+            elif 'items' in data:
+                products = data['items']
+            else:
+                products = data
+        else:
+            products = data
+        
+        logging.info(f"Found {len(products) if isinstance(products, list) else 0} products in response")
         
         # Log structure for debugging
-        if products and len(products) > 0:
-            logging.info(f"Sample product structure: {list(products[0].keys()) if isinstance(products[0], dict) else 'Not a dict'}")
+        if products and len(products) > 0 and isinstance(products, list):
+            logging.info(f"Sample product keys: {list(products[0].keys()) if isinstance(products[0], dict) else 'Not a dict'}")
         
-        for product in products:
-            store_data.append({
-                'barcode': product.get('barcode', ''),
-                'name': product.get('name', ''),
-                'qty': product.get('quantity', product.get('qty', 0)),
-                'id': product.get('id', product.get('product_id', ''))
-            })
+        for product in products if isinstance(products, list) else []:
+            if isinstance(product, dict):
+                store_data.append({
+                    'barcode': product.get('barcode', product.get('sku', '')),
+                    'name': product.get('name', product.get('product_name', '')),
+                    'qty': product.get('quantity', product.get('qty', product.get('stock', 0))),
+                    'id': str(product.get('id', product.get('product_id', '')))
+                })
         
         logging.info(f"Fetched {len(store_data)} products from Store API")
         return store_data
