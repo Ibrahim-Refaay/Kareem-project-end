@@ -52,10 +52,24 @@ def fetch_odoo_data():
     Returns: List of dictionaries with product data
     """
     logging.info(f"Connecting to Odoo: {CONFIG['ODOO_URL']}")
+    logging.info(f"Database: {CONFIG['ODOO_DB']}")
+    logging.info(f"Username: {CONFIG['ODOO_USERNAME']}")
     
     try:
         # Odoo XML-RPC setup
-        common = xmlrpc.client.ServerProxy(f"{CONFIG['ODOO_URL']}/xmlrpc/2/common")
+        common_url = f"{CONFIG['ODOO_URL']}/xmlrpc/2/common"
+        logging.info(f"Common URL: {common_url}")
+        common = xmlrpc.client.ServerProxy(common_url)
+        
+        # Try to get version first (to test connection)
+        try:
+            version_info = common.version()
+            logging.info(f"Odoo version info: {version_info}")
+        except Exception as ve:
+            logging.error(f"Failed to connect to Odoo: {ve}")
+            raise
+        
+        logging.info("Attempting authentication...")
         uid = common.authenticate(
             CONFIG['ODOO_DB'], 
             CONFIG['ODOO_USERNAME'], 
@@ -63,8 +77,19 @@ def fetch_odoo_data():
             {}
         )
         
+        logging.info(f"Authentication result - UID: {uid}")
+        
         if not uid:
-            raise Exception("Failed to authenticate with Odoo")
+            raise Exception(
+                f"Authentication failed!\n"
+                f"Database: {CONFIG['ODOO_DB']}\n"
+                f"Username: {CONFIG['ODOO_USERNAME']}\n"
+                f"Please check:\n"
+                f"1. Database name is correct\n"
+                f"2. Username and password are correct\n"
+                f"3. User has API access enabled\n"
+                f"4. Odoo instance allows external API access"
+            )
         
         models = xmlrpc.client.ServerProxy(f"{CONFIG['ODOO_URL']}/xmlrpc/2/object")
         
