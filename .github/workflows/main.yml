@@ -1,0 +1,73 @@
+name: Inventory Comparison ETL
+
+on:
+  # Run on schedule (e.g., daily at 2 AM UTC)
+  schedule:
+    - cron: '0 2 * * *'
+  
+  # Allow manual trigger
+  workflow_dispatch:
+  
+  # Optional: run on push to main (for testing)
+  # push:
+  #   branches:
+  #     - main
+  #   paths:
+  #     - 'data.py'
+  #     - 'app.py'
+  #     - '.github/workflows/inventory-etl.yml'
+
+jobs:
+  run-etl:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+      
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+      
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      
+      - name: Set up Google Cloud credentials
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
+      
+      - name: Run ETL script
+        env:
+          # Add any environment variables your app.py CONFIG needs
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          STORE_API_URL: ${{ secrets.STORE_API_URL }}
+          STORE_API_KEY: ${{ secrets.STORE_API_KEY }}
+          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}
+          BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+          BIGQUERY_TABLE: ${{ secrets.BIGQUERY_TABLE }}
+        run: |
+          python data.py
+      
+      - name: Upload logs on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: etl-logs
+          path: |
+            *.log
+            **/*.log
+          retention-days: 7
+      
+      - name: Notify on failure
+        if: failure()
+        run: |
+          echo "ETL job failed. Check the logs for details."
+          # Optional: Add Slack/email notification here
