@@ -1,20 +1,9 @@
 name: Inventory Comparison ETL
 
 on:
-  # Run on schedule (e.g., daily at 2 AM UTC)
   schedule:
     - cron: '0 2 * * *'
-  
-  # Allow manual trigger
   workflow_dispatch:
-  
-  # Optional: run on push to main (for testing)
-  # push:
-  #   branches:
-  #     - main
-  #   paths:
-  #     - 'data.py'
-  #     - '.github/workflows/inventory-etl.yml'
 
 jobs:
   run-etl:
@@ -42,18 +31,15 @@ jobs:
       
       - name: Run ETL script
         env:
-          # Non-sensitive data from Repository Variables (vars)
           ODOO_URL: ${{ vars.ODOO_URL }}
           ODOO_DB: ${{ vars.ODOO_DB }}
+          ODOO_USERNAME: ${{ vars.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD }}
           STORE_API_URL: ${{ vars.STORE_API_URL }}
+          STORE_API_KEY: ${{ vars.STORE_API_TOKEN }}
           BIGQUERY_PROJECT: ${{ vars.BIGQUERY_PROJECT }}
           BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET }}
           BIGQUERY_TABLE: ${{ vars.BIGQUERY_TABLE }}
-          
-          # Sensitive data from Repository Secrets (secrets)
-          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
-          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
-          STORE_API_KEY: ${{ secrets.STORE_API_TOKEN }}
         run: |
           python data.py
       
@@ -71,4 +57,3 @@ jobs:
         if: failure()
         run: |
           echo "ETL job failed. Check the logs for details."
-          # Optional: Add Slack/email notification here
