@@ -14,7 +14,6 @@ on:
   #     - main
   #   paths:
   #     - 'data.py'
-  #     - 'app.py'
   #     - '.github/workflows/inventory-etl.yml'
 
 jobs:
@@ -43,16 +42,18 @@ jobs:
       
       - name: Run ETL script
         env:
-          # Add any environment variables your app.py CONFIG needs
-          ODOO_URL: ${{ secrets.ODOO_URL }}
-          ODOO_DB: ${{ secrets.ODOO_DB }}
+          # Non-sensitive data from Repository Variables (vars)
+          ODOO_URL: ${{ vars.ODOO_URL }}
+          ODOO_DB: ${{ vars.ODOO_DB }}
+          STORE_API_URL: ${{ vars.STORE_API_URL }}
+          BIGQUERY_PROJECT: ${{ vars.BIGQUERY_PROJECT }}
+          BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET }}
+          BIGQUERY_TABLE: ${{ vars.BIGQUERY_TABLE }}
+          
+          # Sensitive data from Repository Secrets (secrets)
           ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
           ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
-          STORE_API_URL: ${{ secrets.STORE_API_URL }}
-          STORE_API_KEY: ${{ secrets.STORE_API_KEY }}
-          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}
-          BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
-          BIGQUERY_TABLE: ${{ secrets.BIGQUERY_TABLE }}
+          STORE_API_KEY: ${{ secrets.STORE_API_TOKEN }}
         run: |
           python data.py
       
