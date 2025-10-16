@@ -17,6 +17,8 @@ from typing import Dict, List
 
 import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 from google.cloud import bigquery
 
 
@@ -170,10 +172,30 @@ class InventoryETL:
             "Authorization": f"Bearer {self.store_api_token}",
         }
 
+        # ✅ إعداد retry آمن
+        session = requests.Session()
+        retries = Retry(
+            total=5,
+            backoff_factor=2,
+            status_forcelist=[502, 503, 504, 520],
+            allowed_methods=["GET"],
+            raise_on_status=False,
+        )
+        session.mount("https://", HTTPAdapter(max_retries=retries))
+
         while True:
             url = f"{self.store_api_url}/products/limit/{self.store_batch}/page/{page}"
-            response = requests.get(url, headers=headers, timeout=60)
-            response.raise_for_status()
+            try:
+                response = session.get(url, headers=headers, timeout=90)
+                response.raise_for_status()
+            except requests.exceptions.ChunkedEncodingError:
+                logging.warning("⚠️ Store API chunked error on page %s, retrying...", page)
+                time.sleep(3)
+                continue
+            except requests.exceptions.RequestException as e:
+                logging.error("❌ Store API request failed on page %s: %s", page, e)
+                break
+
             payload = response.json()
             if payload.get("success") != 1:
                 break
@@ -181,16 +203,17 @@ class InventoryETL:
             if not data:
                 break
             all_products.extend(data)
+            logging.info("Fetched page %s (%s total)", page, len(all_products))
             page += 1
+            time.sleep(1)  # ⏳ Delay خفيف بين الصفحات لتجنب انقطاع الاتصال
 
-        logging.info("Fetched %s products from Store API", len(all_products))
+        logging.info("✅ Total fetched from Store API: %s products", len(all_products))
+
         normalized: List[Dict] = []
         for product in all_products:
             barcode = product.get("upc")
-            name = None
             description = product.get("product_description")
-            if isinstance(description, list) and description:
-                name = description[0].get("name")
+            name = description[0].get("name") if isinstance(description, list) and description else None
             normalized.append({
                 "barcode": str(barcode).strip() if barcode else "",
                 "name": name or "",
@@ -302,7 +325,7 @@ class InventoryETL:
         )
 
         elapsed = time.time() - start
-        logging.info("=== ETL completed in %.2fs ===", elapsed)
+        logging.info("=== ✅ ETL completed in %.2fs ===", elapsed)
 
 
 def main() -> None:
