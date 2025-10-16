@@ -56,7 +56,7 @@ class InventoryETL:
         self.odoo_username = _require_env("ODOO_USERNAME")
         self.odoo_password = _require_env("ODOO_PASSWORD")
         self.store_api_url = _require_env("STORE_API_URL").rstrip("/")
-        self.store_api_token = _require_env("STORE_API_TOKEN")
+        self.store_api_token = _require_env("STORE_API_KEY")
         self.bigquery_project = _require_env("BIGQUERY_PROJECT")
         self.dataset_id = _require_env("BIGQUERY_DATASET")
         self.table_id = _require_env("BIGQUERY_TABLE")
