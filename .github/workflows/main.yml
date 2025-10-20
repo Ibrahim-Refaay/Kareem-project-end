@@ -1,59 +1,171 @@
-name: Inventory Comparison ETL
+name: Inventory ETL - Location Filtered
 
 on:
   schedule:
-    - cron: '0 2 * * *'
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
   workflow_dispatch:
+    inputs:
+      max_workers:
+        description: 'Number of parallel workers'
+        required: false
+        default: '5'
+        type: choice
+        options:
+          - '3'
+          - '5'
+          - '10'
+          - '15'
+      use_location_filter:
+        description: 'Filter by location IDs from file'
+        required: false
+        default: 'true'
+        type: boolean
 
 jobs:
   run-etl:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     
     steps:
-      - name: Checkout repository
+      - name: Checkout code
         uses: actions/checkout@v4
-      
+
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
           cache: 'pip'
-      
+
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
-      
-      - name: Set up Google Cloud credentials
+          pip install --upgrade pip
+          pip install pandas requests google-cloud-bigquery urllib3 openpyxl
+
+      - name: Verify location file exists
+        id: check_file
+        run: |
+          if [ -f "odoo_locations.xlsx" ]; then
+            echo "✅ Location file found"
+            echo "file_exists=true" >> $GITHUB_OUTPUT
+            
+            # Show some stats using Python
+            python3 << EOF
+          import pandas as pd
+          df = pd.read_excel("odoo_locations.xlsx")
+          print(f"📊 Found {len(df)} location IDs")
+          print(f"📋 Columns: {', '.join(df.columns.tolist())}")
+          EOF
+          else
+            echo "⚠️ Location file not found - will run without filters"
+            echo "file_exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Authenticate to Google Cloud
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SERVICE_ACCOUNT_KEY }}
-      
-      - name: Run ETL script
+          credentials_json: ${{ secrets.GCP_CREDENTIALS }}
+
+      - name: Run Location-Filtered ETL
         env:
-          ODOO_URL: ${{ vars.ODOO_URL }}
-          ODOO_DB: ${{ vars.ODOO_DB }}
-          ODOO_USERNAME: ${{ vars.ODOO_USERNAME }}
-          ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD }}
-          STORE_API_URL: ${{ vars.STORE_API_URL }}
-          STORE_API_KEY: ${{ vars.STORE_API_KEY }}
-          BIGQUERY_PROJECT: ${{ vars.BIGQUERY_PROJECT }}
-          BIGQUERY_DATASET: ${{ vars.BIGQUERY_DATASET }}
-          BIGQUERY_TABLE: ${{ vars.BIGQUERY_TABLE }}
+          # Odoo Configuration
+          ODOO_URL: ${{ secrets.ODOO_URL }}
+          ODOO_DB: ${{ secrets.ODOO_DB }}
+          ODOO_USERNAME: ${{ secrets.ODOO_USERNAME }}
+          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          ODOO_BATCH: '200'
+          
+          # Store API Configuration
+          STORE_API_URL: ${{ secrets.STORE_API_URL }}
+          STORE_API_KEY: ${{ secrets.STORE_API_KEY }}
+          STORE_BATCH: '200'
+          
+          # BigQuery Configuration
+          BIGQUERY_PROJECT: ${{ secrets.BIGQUERY_PROJECT }}
+          BIGQUERY_DATASET: ${{ secrets.BIGQUERY_DATASET }}
+          BIGQUERY_TABLE: ${{ secrets.BIGQUERY_TABLE }}
+          
+          # Location Filter Configuration
+          ODOO_LOCATIONS_FILE: 'odoo_locations.xlsx'
+          
+          # Parallel Execution Settings
+          ETL_MAX_WORKERS: ${{ github.event.inputs.max_workers || '5' }}
+          
+          # Google Cloud Auth
+          GOOGLE_APPLICATION_CREDENTIALS: ${{ steps.auth.outputs.credentials_file_path }}
         run: |
-          python data.py
-      
-      - name: Upload logs on failure
-        if: failure()
+          echo "🚀 Starting ETL with location filtering..."
+          python inventory_etl.py
+
+      - name: Generate summary report
+        if: always()
+        run: |
+          echo "## 📊 ETL Execution Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "- **Run Time**: $(date)" >> $GITHUB_STEP_SUMMARY
+          echo "- **Location Filter**: ${{ steps.check_file.outputs.file_exists == 'true' && '✅ Enabled' || '⚠️ Disabled' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Max Workers**: ${{ github.event.inputs.max_workers || '5' }}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Status**: ${{ job.status }}" >> $GITHUB_STEP_SUMMARY
+
+      - name: Upload ETL logs
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: etl-logs
+          name: etl-logs-${{ github.run_number }}
           path: |
             *.log
-            **/*.log
           retention-days: 7
-      
-      - name: Notify on failure
-        if: failure()
+
+  # Optional: Validate location file before running ETL
+  validate-location-file:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install pandas
+        run: pip install pandas openpyxl
+
+      - name: Validate location file
         run: |
-          echo "ETL job failed. Check the logs for details."
+          python3 << 'EOF'
+          import pandas as pd
+          import sys
+          
+          try:
+              df = pd.read_excel("odoo_locations.xlsx")
+              
+              print(f"✅ File loaded successfully")
+              print(f"📊 Total rows: {len(df)}")
+              print(f"📋 Columns: {', '.join(df.columns.tolist())}")
+              
+              if 'id' not in df.columns:
+                  print("❌ ERROR: 'id' column not found!")
+                  sys.exit(1)
+              
+              # Check for valid IDs
+              valid_ids = df['id'].dropna()
+              print(f"✅ Valid location IDs: {len(valid_ids)}")
+              
+              # Show sample
+              print(f"\n📝 Sample IDs: {valid_ids.head(10).tolist()}")
+              
+              # Check for duplicates
+              duplicates = df[df.duplicated('id', keep=False)]
+              if not duplicates.empty:
+                  print(f"⚠️ Warning: {len(duplicates)} duplicate IDs found")
+              
+              print("\n✅ Validation passed!")
+              
+          except FileNotFoundError:
+              print("❌ File 'odoo_locations.xlsx' not found!")
+              sys.exit(1)
+          except Exception as e:
+              print(f"❌ Validation failed: {e}")
+              sys.exit(1)
+          EOF
