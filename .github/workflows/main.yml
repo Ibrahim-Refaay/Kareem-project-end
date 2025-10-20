@@ -128,12 +128,12 @@ jobs:
           ODOO_URL: ${{ vars.ODOO_URL }}
           ODOO_DB: ${{ vars.ODOO_DB }}
           ODOO_USERNAME: ${{ vars.ODOO_USERNAME }}
-          ODOO_PASSWORD: ${{ secrets.ODOO_PASSWORD }}
+          ODOO_PASSWORD: ${{ vars.ODOO_PASSWORD }}
           ODOO_BATCH: '200'
           
           # Store API Configuration
           STORE_API_URL: ${{ vars.STORE_API_URL }}
-          STORE_API_KEY: ${{ secrets.STORE_API_KEY }}
+          STORE_API_KEY: ${{ vars.STORE_API_KEY }}
           STORE_BATCH: '200'
           
           # BigQuery Configuration
