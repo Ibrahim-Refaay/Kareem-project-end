@@ -1,8 +1,6 @@
-"""Standalone ETL script for running inventory comparison in CI/CD.
+"""Parallelized ETL script with location filtering for Odoo inventory.
 
-Reads configuration from environment variables so it can be executed inside
-GitHub Actions or any other automation environment without depending on the
-Flask app configuration module.
+Reads location IDs from an Excel file and fetches inventory only for those locations.
 """
 
 from __future__ import annotations
@@ -12,8 +10,10 @@ import logging
 import os
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import Dict, List
+from pathlib import Path
+from typing import Dict, List, Optional, Set
 
 import pandas as pd
 import requests
@@ -49,10 +49,30 @@ def _require_env(name: str) -> str:
     return value
 
 
-class InventoryETL:
-    """Encapsulates inventory comparison logic."""
+def load_location_ids(filepath: str) -> Set[int]:
+    """Load location IDs from Excel file."""
+    if not Path(filepath).exists():
+        logging.error("Location file not found: %s", filepath)
+        return set()
+    
+    try:
+        df = pd.read_excel(filepath)
+        if 'id' not in df.columns:
+            logging.error("Column 'id' not found in %s", filepath)
+            return set()
+        
+        location_ids = set(df['id'].dropna().astype(int).tolist())
+        logging.info("Loaded %s location IDs from %s", len(location_ids), filepath)
+        return location_ids
+    except Exception as e:
+        logging.error("Failed to load location IDs: %s", e)
+        return set()
 
-    def __init__(self) -> None:
+
+class InventoryETL:
+    """Encapsulates inventory comparison logic with location filtering."""
+
+    def __init__(self, location_ids: Optional[Set[int]] = None) -> None:
         self.odoo_url = _require_env("ODOO_URL").rstrip("/")
         self.odoo_db = _require_env("ODOO_DB")
         self.odoo_username = _require_env("ODOO_USERNAME")
@@ -65,7 +85,9 @@ class InventoryETL:
         self.staging_table_id = f"{self.table_id}_staging"
         self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
         self.store_batch = _load_env_int("STORE_BATCH", 200)
-
+        self.max_workers = _load_env_int("ETL_MAX_WORKERS", 5)
+        self.location_ids = location_ids or set()
+        
     # ------------------------------------------------------------------ Odoo --
     def _get_odoo_session(self) -> Dict:
         auth_url = f"{self.odoo_url}/web/session/authenticate"
@@ -85,57 +107,89 @@ class InventoryETL:
             raise RuntimeError("Odoo authentication failed; no UID returned.")
         return response.cookies.get_dict()
 
-    def fetch_odoo_data(self) -> List[Dict]:
-        session = self._get_odoo_session()
-        offset = 0
-        all_products: List[Dict] = []
-
-        while True:
-            payload = {
-                "jsonrpc": "2.0",
-                "method": "call",
-                "params": {
-                    "model": "product.product",
-                    "method": "search_read",
-                    "args": [[
-                        ["type", "=", "product"],
-                        ["barcode", "!=", False],
-                        ["barcode", "!=", ""],
-                    ]],
-                    "kwargs": {
-                        "fields": ["id", "display_name", "barcode"],
-                        "limit": self.odoo_batch,
-                        "offset": offset,
-                    },
+    def _fetch_odoo_batch(self, session: Dict, offset: int) -> List[Dict]:
+        """Fetch a single batch of Odoo products."""
+        payload = {
+            "jsonrpc": "2.0",
+            "method": "call",
+            "params": {
+                "model": "product.product",
+                "method": "search_read",
+                "args": [[
+                    ["type", "=", "product"],
+                    ["barcode", "!=", False],
+                    ["barcode", "!=", ""],
+                ]],
+                "kwargs": {
+                    "fields": ["id", "display_name", "barcode"],
+                    "limit": self.odoo_batch,
+                    "offset": offset,
                 },
-            }
-            rpc_url = f"{self.odoo_url}/web/dataset/call_kw"
-            response = requests.post(rpc_url, json=payload, cookies=session, timeout=60)
-            response.raise_for_status()
-            batch = response.json().get("result", [])
-            if not batch:
-                break
-            all_products.extend(batch)
-            offset += self.odoo_batch
+            },
+        }
+        rpc_url = f"{self.odoo_url}/web/dataset/call_kw"
+        response = requests.post(rpc_url, json=payload, cookies=session, timeout=60)
+        response.raise_for_status()
+        batch = response.json().get("result", [])
+        logging.info("Fetched Odoo batch at offset %s: %s products", offset, len(batch))
+        return batch
 
-        # Fetch stock quantities
+    def fetch_odoo_data(self) -> List[Dict]:
+        """Fetch Odoo data with parallel batch requests and location filtering."""
+        session = self._get_odoo_session()
+        
+        # First, get total count to determine number of batches
+        initial_batch = self._fetch_odoo_batch(session, 0)
+        all_products = initial_batch.copy()
+        
+        if len(initial_batch) == self.odoo_batch:
+            # More batches needed - fetch remaining in parallel
+            offsets = list(range(self.odoo_batch, self.odoo_batch * 100, self.odoo_batch))
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                futures = {
+                    executor.submit(self._fetch_odoo_batch, session, offset): offset 
+                    for offset in offsets
+                }
+                
+                for future in as_completed(futures):
+                    try:
+                        batch = future.result()
+                        if batch:
+                            all_products.extend(batch)
+                        else:
+                            break
+                    except Exception as e:
+                        offset = futures[future]
+                        logging.error("Failed to fetch Odoo batch at offset %s: %s", offset, e)
+
+        # Fetch stock quantities with location filtering
+        stock_domain = [["location_id.usage", "=", "internal"]]
+        
+        if self.location_ids:
+            # Filter by specific location IDs
+            stock_domain.append(["location_id", "in", list(self.location_ids)])
+            logging.info("Filtering stock by %s location IDs", len(self.location_ids))
+        
         stock_payload = {
             "jsonrpc": "2.0",
             "method": "call",
             "params": {
                 "model": "stock.quant",
                 "method": "search_read",
-                "args": [[["location_id.usage", "=", "internal"]]],
+                "args": [stock_domain],
                 "kwargs": {
-                    "fields": ["product_id", "quantity", "reserved_quantity"],
+                    "fields": ["product_id", "quantity", "reserved_quantity", "location_id"],
                     "limit": 0,
                 },
             },
         }
         rpc_url = f"{self.odoo_url}/web/dataset/call_kw"
-        response = requests.post(rpc_url, json=stock_payload, cookies=session, timeout=60)
+        response = requests.post(rpc_url, json=stock_payload, cookies=session, timeout=120)
         response.raise_for_status()
         stock_quants = response.json().get("result", [])
+        
+        logging.info("Fetched %s stock quants from filtered locations", len(stock_quants))
 
         stock_map: Dict[int, Dict[str, float]] = {}
         for quant in stock_quants:
@@ -144,6 +198,14 @@ class InventoryETL:
                 product_id = product[0]
             else:
                 product_id = product
+            
+            # Verify location is in filter (if filter is active)
+            if self.location_ids:
+                location = quant.get("location_id")
+                location_id = location[0] if isinstance(location, list) else location
+                if location_id not in self.location_ids:
+                    continue
+            
             entry = stock_map.setdefault(product_id, {"onHand": 0.0, "reserved": 0.0})
             entry["onHand"] += quant.get("quantity", 0.0)
             entry["reserved"] += quant.get("reserved_quantity", 0.0)
@@ -152,6 +214,11 @@ class InventoryETL:
         for product in all_products:
             product_id = product.get("id")
             stock_info = stock_map.get(product_id, {"onHand": 0.0, "reserved": 0.0})
+            
+            # Only include products with stock in filtered locations
+            if self.location_ids and stock_info["onHand"] == 0.0:
+                continue
+                
             available = max(stock_info["onHand"] - stock_info["reserved"], 0.0)
             results.append({
                 "barcode": product.get("barcode", ""),
@@ -159,20 +226,12 @@ class InventoryETL:
                 "quantity": int(available),
             })
 
-        logging.info("Fetched %s products from Odoo", len(results))
+        logging.info("Fetched %s products from Odoo (filtered by locations)", len(results))
         return results
 
     # ---------------------------------------------------------------- Store --
-    def fetch_store_data(self) -> List[Dict]:
-        page = 1
-        all_products: List[Dict] = []
-
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {self.store_api_token}",
-        }
-
-        # ✅ إعداد retry آمن
+    def _create_store_session(self) -> requests.Session:
+        """Create a requests session with retry configuration."""
         session = requests.Session()
         retries = Retry(
             total=5,
@@ -182,30 +241,90 @@ class InventoryETL:
             raise_on_status=False,
         )
         session.mount("https://", HTTPAdapter(max_retries=retries))
+        return session
 
-        while True:
-            url = f"{self.store_api_url}/products/limit/{self.store_batch}/page/{page}"
+    def _fetch_store_page(self, page: int, session: Optional[requests.Session] = None) -> List[Dict]:
+        """Fetch a single page from Store API."""
+        if session is None:
+            session = self._create_store_session()
+            
+        headers = {
+            "accept": "application/json",
+            "Authorization": f"Bearer {self.store_api_token}",
+        }
+        
+        url = f"{self.store_api_url}/products/limit/{self.store_batch}/page/{page}"
+        max_retries = 3
+        
+        for attempt in range(max_retries):
             try:
                 response = session.get(url, headers=headers, timeout=90)
                 response.raise_for_status()
+                payload = response.json()
+                
+                if payload.get("success") != 1:
+                    return []
+                    
+                data = payload.get("data") or []
+                logging.info("Fetched Store page %s: %s products", page, len(data))
+                return data
+                
             except requests.exceptions.ChunkedEncodingError:
-                logging.warning("⚠️ Store API chunked error on page %s, retrying...", page)
-                time.sleep(3)
-                continue
+                logging.warning("⚠️ Store API chunked error on page %s, attempt %s/%s", 
+                              page, attempt + 1, max_retries)
+                time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
                 logging.error("❌ Store API request failed on page %s: %s", page, e)
-                break
+                if attempt < max_retries - 1:
+                    time.sleep(2 ** attempt)
+                else:
+                    return []
+        
+        return []
 
-            payload = response.json()
-            if payload.get("success") != 1:
-                break
-            data = payload.get("data") or []
-            if not data:
-                break
-            all_products.extend(data)
-            logging.info("Fetched page %s (%s total)", page, len(all_products))
-            page += 1
-            time.sleep(1)  # ⏳ Delay خفيف بين الصفحات لتجنب انقطاع الاتصال
+    def fetch_store_data(self) -> List[Dict]:
+        """Fetch Store data with parallel page requests."""
+        all_products: List[Dict] = []
+        
+        # Fetch first page to determine if more pages exist
+        first_page = self._fetch_store_page(1)
+        if not first_page:
+            logging.warning("No products found in Store API")
+            return []
+        
+        all_products.extend(first_page)
+        
+        # If first page is full, fetch more pages in parallel
+        if len(first_page) == self.store_batch:
+            page = 2
+            empty_pages = 0
+            max_empty = 3  # Stop after 3 consecutive empty pages
+            
+            while empty_pages < max_empty and page < 1000:  # Safety limit
+                # Fetch next batch of pages in parallel
+                pages_to_fetch = list(range(page, page + self.max_workers))
+                
+                with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                    futures = {
+                        executor.submit(self._fetch_store_page, p): p 
+                        for p in pages_to_fetch
+                    }
+                    
+                    for future in as_completed(futures):
+                        page_num = futures[future]
+                        try:
+                            data = future.result()
+                            if data:
+                                all_products.extend(data)
+                                empty_pages = 0
+                            else:
+                                empty_pages += 1
+                        except Exception as e:
+                            logging.error("Failed to fetch Store page %s: %s", page_num, e)
+                            empty_pages += 1
+                
+                page += self.max_workers
+                time.sleep(0.5)  # Small delay between batches
 
         logging.info("✅ Total fetched from Store API: %s products", len(all_products))
 
@@ -225,13 +344,14 @@ class InventoryETL:
     # ------------------------------------------------------------- Compare --
     @staticmethod
     def compare_inventories(odoo_products: List[Dict], store_products: List[Dict]) -> List[Dict]:
+        """Compare inventories using parallel processing for large datasets."""
         store_map = {item["barcode"]: item for item in store_products if item.get("barcode")}
-        comparison: List[Dict] = []
-
-        for odoo_product in odoo_products:
+        
+        def compare_product(odoo_product: Dict) -> Optional[Dict]:
             barcode = odoo_product.get("barcode")
             if not barcode:
-                continue
+                return None
+                
             store_product = store_map.get(barcode)
             odoo_qty = odoo_product.get("quantity", 0)
             store_qty = store_product.get("quantity", 0) if store_product else None
@@ -246,10 +366,15 @@ class InventoryETL:
             }
 
             if store_product is None:
-                record.update({
-                    "status": "❌ NOT FOUND IN STORE",
-                    "difference": "N/A",
-                })
+                # Only report as NOT FOUND if Odoo quantity > 0
+                if odoo_qty > 0:
+                    record.update({
+                        "status": "❌ NOT FOUND IN STORE",
+                        "difference": "N/A",
+                    })
+                else:
+                    # Skip products with 0 quantity in Odoo that aren't in store
+                    return None
             elif odoo_qty == store_qty:
                 record.update({
                     "status": "✅ MATCH",
@@ -261,7 +386,23 @@ class InventoryETL:
                     "difference": odoo_qty - store_qty,
                 })
 
-            comparison.append(record)
+            return record
+
+        # Parallel comparison for large datasets
+        comparison: List[Dict] = []
+        if len(odoo_products) > 1000:
+            with ThreadPoolExecutor(max_workers=os.cpu_count() or 4) as executor:
+                futures = [executor.submit(compare_product, product) for product in odoo_products]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        comparison.append(result)
+        else:
+            # Sequential for smaller datasets
+            for product in odoo_products:
+                result = compare_product(product)
+                if result:
+                    comparison.append(result)
 
         logging.info("Compared %s products", len(comparison))
         return comparison
@@ -279,10 +420,17 @@ class InventoryETL:
     # ---------------------------------------------------------------- Public --
     def run(self) -> None:
         start = time.time()
-        logging.info("=== Starting Inventory ETL ===")
+        filter_info = f"with {len(self.location_ids)} location filters" if self.location_ids else "without filters"
+        logging.info("=== Starting Inventory ETL %s (workers=%s) ===", filter_info, self.max_workers)
 
-        odoo_data = self.fetch_odoo_data()
-        store_data = self.fetch_store_data()
+        # Fetch data from both sources in parallel
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            odoo_future = executor.submit(self.fetch_odoo_data)
+            store_future = executor.submit(self.fetch_store_data)
+            
+            odoo_data = odoo_future.result()
+            store_data = store_future.result()
+
         comparison = self.compare_inventories(odoo_data, store_data)
 
         if not comparison:
@@ -309,20 +457,26 @@ class InventoryETL:
         df["odoo_qty"] = pd.to_numeric(df["odoo_qty"], errors="coerce").astype("Int64")
         df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce").astype("Int64")
 
-        # Upload main table and staging snapshot
-        self.load_dataframe(
-            df,
-            table=self.table_id,
-            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
-
-        staging_df = df.copy()
-        staging_df.insert(0, "run_date", timestamp.date())
-        self.load_dataframe(
-            staging_df,
-            table=self.staging_table_id,
-            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-        )
+        # Upload both tables in parallel
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            main_future = executor.submit(
+                self.load_dataframe,
+                df,
+                table=self.table_id,
+                disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            )
+            
+            staging_df = df.copy()
+            staging_df.insert(0, "run_date", timestamp.date())
+            staging_future = executor.submit(
+                self.load_dataframe,
+                staging_df,
+                table=self.staging_table_id,
+                disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+            )
+            
+            main_future.result()
+            staging_future.result()
 
         elapsed = time.time() - start
         logging.info("=== ✅ ETL completed in %.2fs ===", elapsed)
@@ -333,7 +487,14 @@ def main() -> None:
         logging.critical("GOOGLE_APPLICATION_CREDENTIALS must point to a service account key file.")
         sys.exit(1)
 
-    etl = InventoryETL()
+    # Load location IDs if file exists
+    location_file = os.getenv("ODOO_LOCATIONS_FILE", "odoo_locations.xlsx")
+    location_ids = load_location_ids(location_file)
+    
+    if not location_ids:
+        logging.warning("No location filters loaded - will fetch ALL locations")
+    
+    etl = InventoryETL(location_ids=location_ids)
     etl.run()
 
 
