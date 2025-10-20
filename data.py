@@ -409,13 +409,51 @@ class InventoryETL:
 
     # -------------------------------------------------------------- BigQuery --
     def load_dataframe(self, df: pd.DataFrame, table: str, disposition: str) -> None:
+        """Load DataFrame to BigQuery with proper partition handling."""
         client = bigquery.Client(project=self.bigquery_project)
         table_ref = f"{self.bigquery_project}.{self.dataset_id}.{table}"
-        job_config = bigquery.LoadJobConfig(write_disposition=disposition)
-        logging.info("Loading %s rows into %s", len(df), table_ref)
-        load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
-        load_job.result()
-        logging.info("Load complete: %s", table_ref)
+        
+        # Configure job for partitioned table
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=disposition,
+            # Important: Specify schema to ensure timestamp is properly formatted
+            schema=[
+                bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED"),
+                bigquery.SchemaField("barcode", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("odoo_name", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("odoo_qty", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("store_name", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("store_qty", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("store_id", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("difference", "STRING", mode="NULLABLE"),
+            ],
+            # Enable time partitioning
+            time_partitioning=bigquery.TimePartitioning(
+                type_=bigquery.TimePartitioningType.DAY,
+                field="timestamp",
+                expiration_ms=30 * 24 * 60 * 60 * 1000  # 30 days in milliseconds
+            )
+        )
+        
+        logging.info("Loading %s rows into %s (partitioned by timestamp)", len(df), table_ref)
+        
+        try:
+            load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+            load_job.result()  # Wait for the job to complete
+            
+            # Verify the load
+            destination_table = client.get_table(table_ref)
+            logging.info("✅ Load complete: %s", table_ref)
+            logging.info("   Total rows in table: %s", destination_table.num_rows)
+            logging.info("   Loaded rows: %s", len(df))
+            
+        except Exception as e:
+            logging.error("❌ Failed to load data to BigQuery: %s", e)
+            logging.error("   Table: %s", table_ref)
+            logging.error("   DataFrame shape: %s", df.shape)
+            logging.error("   DataFrame dtypes:\n%s", df.dtypes)
+            raise
 
     # ---------------------------------------------------------------- Public --
     def run(self) -> None:
@@ -453,30 +491,36 @@ class InventoryETL:
             })
 
         df = pd.DataFrame(rows)
-        df["timestamp"] = pd.to_datetime(df["timestamp"])
-        df["odoo_qty"] = pd.to_numeric(df["odoo_qty"], errors="coerce").astype("Int64")
-        df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce").astype("Int64")
+        
+        # Ensure proper data types for BigQuery partitioned table
+        df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
+        df["odoo_qty"] = pd.to_numeric(df["odoo_qty"], errors="coerce").fillna(0).astype("int64")
+        df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce").fillna(0).astype("int64")
+        df["barcode"] = df["barcode"].astype(str)
+        df["odoo_name"] = df["odoo_name"].astype(str)
+        df["store_name"] = df["store_name"].fillna("").astype(str)
+        df["store_id"] = df["store_id"].fillna("").astype(str)
+        df["status"] = df["status"].astype(str)
+        df["difference"] = df["difference"].astype(str)
+        
+        logging.info("Prepared %s records for upload", len(df))
+        logging.info("Timestamp range: %s to %s", df["timestamp"].min(), df["timestamp"].max())
+        logging.info("DataFrame dtypes:\n%s", df.dtypes)
 
-        # Upload both tables in parallel
-        with ThreadPoolExecutor(max_workers=2) as executor:
-            main_future = executor.submit(
-                self.load_dataframe,
-                df,
-                table=self.table_id,
-                disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            )
-            
-            staging_df = df.copy()
-            staging_df.insert(0, "run_date", timestamp.date())
-            staging_future = executor.submit(
-                self.load_dataframe,
-                staging_df,
-                table=self.staging_table_id,
-                disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
-            )
-            
-            main_future.result()
-            staging_future.result()
+        # Upload main table and staging snapshot
+        self.load_dataframe(
+            df,
+            table=self.table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
+
+        staging_df = df.copy()
+        staging_df.insert(0, "run_date", timestamp.date())
+        self.load_dataframe(
+            staging_df,
+            table=self.staging_table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
 
         elapsed = time.time() - start
         logging.info("=== ✅ ETL completed in %.2fs ===", elapsed)
