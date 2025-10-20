@@ -413,10 +413,12 @@ class InventoryETL:
         client = bigquery.Client(project=self.bigquery_project)
         table_ref = f"{self.bigquery_project}.{self.dataset_id}.{table}"
         
-        # Configure job for partitioned table
+        # Simple job config - table already has partitioning configured
         job_config = bigquery.LoadJobConfig(
             write_disposition=disposition,
-            # Important: Specify schema to ensure timestamp is properly formatted
+            # Let BigQuery auto-detect schema from DataFrame
+            autodetect=False,
+            # Specify schema to ensure proper types
             schema=[
                 bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED"),
                 bigquery.SchemaField("barcode", "STRING", mode="NULLABLE"),
@@ -427,13 +429,7 @@ class InventoryETL:
                 bigquery.SchemaField("store_id", "STRING", mode="NULLABLE"),
                 bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
                 bigquery.SchemaField("difference", "STRING", mode="NULLABLE"),
-            ],
-            # Enable time partitioning
-            time_partitioning=bigquery.TimePartitioning(
-                type_=bigquery.TimePartitioningType.DAY,
-                field="timestamp",
-                expiration_ms=30 * 24 * 60 * 60 * 1000  # 30 days in milliseconds
-            )
+            ]
         )
         
         logging.info("Loading %s rows into %s (partitioned by timestamp)", len(df), table_ref)
