@@ -1,6 +1,9 @@
 pandas>=2.0.0
 google-cloud-bigquery>=3.11.0
 pyarrow
+urllib3>=2.0.0
+openpyxl>=3.1.0
+
 # Add other dependencies from your project:
 # requests>=2.31.0
 # xmlrpc (if using Odoo)
