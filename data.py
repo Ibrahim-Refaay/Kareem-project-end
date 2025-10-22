@@ -81,7 +81,7 @@ class InventoryETL:
         self.store_api_token = _require_env("STORE_API_KEY")
         self.bigquery_project = _require_env("BIGQUERY_PROJECT")
         self.dataset_id = _require_env("BIGQUERY_DATASET")
-        self.table_id = _require_env("BIGQUERY_TABLE")
+        self.table_id = "comparisons"  # <-- MODIFIED: Hardcoded table name
         self.staging_table_id = f"{self.table_id}_staging"
         self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
         self.store_batch = _load_env_int("STORE_BATCH", 200)
@@ -271,7 +271,7 @@ class InventoryETL:
                 
             except requests.exceptions.ChunkedEncodingError:
                 logging.warning("⚠️ Store API chunked error on page %s, attempt %s/%s", 
-                              page, attempt + 1, max_retries)
+                                page, attempt + 1, max_retries)
                 time.sleep(2 ** attempt)
             except requests.exceptions.RequestException as e:
                 logging.error("❌ Store API request failed on page %s: %s", page, e)
