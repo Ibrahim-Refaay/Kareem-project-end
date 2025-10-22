@@ -366,7 +366,7 @@ class InventoryETL:
             }
 
             if store_product is None:
-                # Only report as NOT FOUND if Odoo quantity > 0
+                # Only report as NOT FOUND if Odoo quantity >= 0
                 if odoo_qty > 0:
                     record.update({
                         "status": "❌ NOT FOUND IN STORE",
