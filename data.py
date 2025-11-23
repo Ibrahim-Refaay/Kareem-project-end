@@ -99,7 +99,7 @@ class InventoryETL:
         self.table_id = "comparisons"  # Hardcoded table name
         self.staging_table_id = f"{self.table_id}_staging"
         self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
-        self.store_batch = _load_env_int("STORE_BATCH", 100)  # Reduced from 200 for stability
+        self.store_batch = _load_env_int("STORE_BATCH", 50)  # Reduced to 50 for better stability with chunked errors
         self.max_workers = _load_env_int("ETL_MAX_WORKERS", 5)
         self.location_ids = location_ids or set()
 
@@ -301,6 +301,24 @@ class InventoryETL:
         return stock_by_product
 
     # ---------------------------------------------------------------- Store --
+    def _create_store_session(self) -> requests.Session:
+        """Create a requests session with retry adapter for better connection handling."""
+        session = requests.Session()
+        retry_strategy = Retry(
+            total=0,  # We handle retries manually
+            backoff_factor=0,
+            status_forcelist=[500, 502, 503, 504],
+        )
+        adapter = HTTPAdapter(
+            max_retries=retry_strategy,
+            pool_connections=10,
+            pool_maxsize=10,
+            pool_block=False,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        return session
+
     def fetch_store_data(self) -> List[Dict]:
         """Fetch Store data using a resilient paged fetcher.
 
@@ -310,9 +328,10 @@ class InventoryETL:
         """
         page = 1
         all_products: List[Dict] = []
-        max_retries = 5  # Increased from 3 for better reliability
+        max_retries = 7  # Increased for chunked encoding errors
         consecutive_failures = 0
-        max_consecutive_failures = 5  # Allow more failures before stopping
+        max_consecutive_failures = 3  # Be more aggressive about stopping
+        session = self._create_store_session()
 
         logging.info("📦 Starting fetch of Store products from %s", self.store_api_url)
 
@@ -327,13 +346,13 @@ class InventoryETL:
                         'accept': 'application/json',
                         'Content-Type': 'application/json',
                         'Authorization': f"Bearer {self.store_api_token}",
-                        'Connection': 'keep-alive'
+                        'Connection': 'close'  # Force new connection each time
                     }
 
-                    response = requests.get(
+                    response = session.get(
                         url,
                         headers=headers,
-                        timeout=60,
+                        timeout=90,  # Increased timeout for slow responses
                         stream=False,
                         verify=True,
                     )
@@ -368,8 +387,9 @@ class InventoryETL:
 
                 except requests.exceptions.ChunkedEncodingError as e:
                     retry_count += 1
-                    logging.warning("⚠️ Store API chunked error on page %s, attempt %s/%s: %s", page, retry_count, max_retries, e)
-                    time.sleep(3 * retry_count)  # Longer backoff for chunked errors
+                    wait_time = min(5 * (2 ** (retry_count - 1)), 60)  # Exponential: 5, 10, 20, 40, 60...
+                    logging.warning("⚠️ Store API chunked error on page %s, attempt %s/%s: %s (waiting %ss)", page, retry_count, max_retries, e, wait_time)
+                    time.sleep(wait_time)
                 except requests.exceptions.ConnectionError as e:
                     retry_count += 1
                     logging.warning("⚠️ Store API connection error on page %s, attempt %s/%s: %s", page, retry_count, max_retries, e)
