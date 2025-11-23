@@ -1,7 +1,7 @@
-"""Parallelized ETL script with location filtering for Odoo inventory.
+"""Parallelized ETL script with location filtering for Odoo inventory - BigQuery version.
 
 Reads location IDs from an Excel file and fetches inventory only for those locations.
-Compares Odoo vs Store API and saves results as Excel files (no BigQuery).
+Compares Odoo vs Store API and saves results to BigQuery.
 """
 
 from __future__ import annotations
@@ -19,6 +19,7 @@ import pandas as pd
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from google.cloud import bigquery
 
 
 logging.basicConfig(
@@ -93,7 +94,10 @@ class InventoryETL:
         self.odoo_password = _require_env("ODOO_PASSWORD")
         self.store_api_url = _require_env("STORE_API_URL").rstrip("/")
         self.store_api_token = _require_env("STORE_API_KEY")
-
+        self.bigquery_project = _require_env("BIGQUERY_PROJECT")
+        self.dataset_id = _require_env("BIGQUERY_DATASET")
+        self.table_id = "comparisons"  # Hardcoded table name
+        self.staging_table_id = f"{self.table_id}_staging"
         self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
         self.store_batch = _load_env_int("STORE_BATCH", 100)  # Reduced from 200 for stability
         self.max_workers = _load_env_int("ETL_MAX_WORKERS", 5)
@@ -297,62 +301,8 @@ class InventoryETL:
         return stock_by_product
 
     # ---------------------------------------------------------------- Store --
-    def _create_store_session(self) -> requests.Session:
-        """Create a requests session with retry configuration."""
-        session = requests.Session()
-        retries = Retry(
-            total=5,
-            backoff_factor=2,
-            status_forcelist=[502, 503, 504, 520],
-            allowed_methods=["GET"],
-            raise_on_status=False,
-        )
-        session.mount("https://", HTTPAdapter(max_retries=retries))
-        return session
-
-    def _fetch_store_page(self, page: int, session: Optional[requests.Session] = None) -> List[Dict]:
-        """Fetch a single page from Store API."""
-        if session is None:
-            session = self._create_store_session()
-            
-        headers = {
-            "accept": "application/json",
-            "Authorization": f"Bearer {self.store_api_token}",
-        }
-        
-        url = f"{self.store_api_url}/products/limit/{self.store_batch}/page/{page}"
-        max_retries = 3
-        
-        for attempt in range(max_retries):
-            try:
-                response = session.get(url, headers=headers, timeout=90)
-                response.raise_for_status()
-                payload = response.json()
-                
-                if payload.get("success") != 1:
-                    return []
-                    
-                data = payload.get("data") or []
-                logging.info("Fetched Store page %s: %s products", page, len(data))
-                return data
-                
-            except requests.exceptions.ChunkedEncodingError:
-                logging.warning(
-                    "⚠️ Store API chunked error on page %s, attempt %s/%s",
-                    page, attempt + 1, max_retries
-                )
-                time.sleep(2 ** attempt)
-            except requests.exceptions.RequestException as e:
-                logging.error("❌ Store API request failed on page %s: %s", page, e)
-                if attempt < max_retries - 1:
-                    time.sleep(2 ** attempt)
-                else:
-                    return []
-        
-        return []
-
     def fetch_store_data(self) -> List[Dict]:
-        """Fetch Store data using a resilient paged fetcher provided by the user.
+        """Fetch Store data using a resilient paged fetcher.
 
         This method pages through `/products/limit/{batch}/page/{page}` until
         no more data is returned. It implements retries for transient
@@ -556,6 +506,50 @@ class InventoryETL:
         logging.info("Compared %s products", len(comparison))
         return comparison
 
+    # -------------------------------------------------------------- BigQuery --
+    def load_dataframe(self, df: pd.DataFrame, table: str, disposition: str) -> None:
+        """Load DataFrame to BigQuery with proper partition handling."""
+        client = bigquery.Client(project=self.bigquery_project)
+        table_ref = f"{self.bigquery_project}.{self.dataset_id}.{table}"
+        
+        # Simple job config - table already has partitioning configured
+        job_config = bigquery.LoadJobConfig(
+            write_disposition=disposition,
+            # Specify schema to ensure proper types
+            autodetect=False,
+            schema=[
+                bigquery.SchemaField("timestamp", "TIMESTAMP", mode="REQUIRED"),
+                bigquery.SchemaField("barcode", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("odoo_name", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("odoo_qty", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("store_name", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("store_qty", "INTEGER", mode="NULLABLE"),
+                bigquery.SchemaField("store_id", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("status", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("difference", "STRING", mode="NULLABLE"),
+                bigquery.SchemaField("locations_with_stock", "STRING", mode="NULLABLE"),
+            ]
+        )
+        
+        logging.info("Loading %s rows into %s (partitioned by timestamp)", len(df), table_ref)
+        
+        try:
+            load_job = client.load_table_from_dataframe(df, table_ref, job_config=job_config)
+            load_job.result()  # Wait for the job to complete
+            
+            # Verify the load
+            destination_table = client.get_table(table_ref)
+            logging.info("✅ Load complete: %s", table_ref)
+            logging.info("   Total rows in table: %s", destination_table.num_rows)
+            logging.info("   Loaded rows: %s", len(df))
+            
+        except Exception as e:
+            logging.error("❌ Failed to load data to BigQuery: %s", e)
+            logging.error("   Table: %s", table_ref)
+            logging.error("   DataFrame shape: %s", df.shape)
+            logging.error("   DataFrame dtypes:\n%s", df.dtypes)
+            raise
+
     # ---------------------------------------------------------------- Public --
     def run(self) -> None:
         start = time.time()
@@ -593,17 +587,16 @@ class InventoryETL:
                 "store_qty": item.get("store_qty"),
                 "store_id": item.get("store_id"),
                 "status": item.get("status"),
-                "difference": item.get("difference"),
+                "difference": str(item.get("difference")),
                 "locations_with_stock": item.get("locations_with_stock", ""),
             })
 
         df = pd.DataFrame(rows)
-
-        # Ensure consistent dtypes
+        
+        # Ensure proper data types for BigQuery partitioned table
         df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
         df["odoo_qty"] = pd.to_numeric(df["odoo_qty"], errors="coerce").fillna(0).astype("int64")
-        df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce")
-        # store_qty may be NaN when not found in store, keep as float
+        df["store_qty"] = pd.to_numeric(df["store_qty"], errors="coerce").fillna(0).astype("int64")
         df["barcode"] = df["barcode"].astype(str)
         df["odoo_name"] = df["odoo_name"].astype(str)
         df["store_name"] = df["store_name"].fillna("").astype(str)
@@ -611,62 +604,35 @@ class InventoryETL:
         df["status"] = df["status"].astype(str)
         df["difference"] = df["difference"].astype(str)
         df["locations_with_stock"] = df["locations_with_stock"].fillna("").astype(str)
-
-        logging.info("Prepared %s records for Excel export", len(df))
+        
+        logging.info("Prepared %s records for BigQuery upload", len(df))
         logging.info("Timestamp range: %s to %s", df["timestamp"].min(), df["timestamp"].max())
         logging.info("DataFrame dtypes:\n%s", df.dtypes)
 
-        # ---------------------------------------------------------
-        # Ensure timestamps are timezone-naive for Excel export
-        # Excel does not support timezone-aware datetimes; convert to naive UTC
-        try:
-            if getattr(df["timestamp"].dtype, "tz", None) is not None:
-                df["timestamp"] = df["timestamp"].dt.tz_convert("UTC").dt.tz_localize(None)
-                logging.info("Converted timezone-aware timestamps to UTC naive datetimes for Excel export")
-        except Exception:
-            # Fallback: remove tzinfo per cell (works even if some rows are naive)
-            df["timestamp"] = df["timestamp"].apply(
-                lambda t: t.replace(tzinfo=None) if getattr(t, "tzinfo", None) is not None else t
-            )
+        # Upload main table and staging snapshot
+        self.load_dataframe(
+            df,
+            table=self.table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
 
-        # ---------------------------------------------------------
-        # Save results locally as Excel files
-        # ---------------------------------------------------------
-        output_dir = os.getenv("ETL_OUTPUT_DIR", "etl_outputs")
-        os.makedirs(output_dir, exist_ok=True)
-
-        timestamp_str = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-
-        # 1) Full comparison file with all columns and conditions
-        full_path = os.path.join(output_dir, f"inventory_comparison_{timestamp_str}.xlsx")
-        df.to_excel(full_path, index=False)
-        logging.info("📁 Saved full comparison Excel file: %s", full_path)
-
-        # 2) Optional per-status summary files
-        matched = df[df["status"] == "✅ MATCH"]
-        mismatch = df[df["status"] == "⚠ QUANTITY MISMATCH"]
-        not_found = df[df["status"] == "❌ NOT FOUND IN STORE"]
-
-        if not matched.empty:
-            matched_path = os.path.join(output_dir, f"matched_{timestamp_str}.xlsx")
-            matched.to_excel(matched_path, index=False)
-            logging.info("📊 Saved MATCHED Excel file: %s", matched_path)
-
-        if not mismatch.empty:
-            mismatch_path = os.path.join(output_dir, f"mismatch_{timestamp_str}.xlsx")
-            mismatch.to_excel(mismatch_path, index=False)
-            logging.info("📊 Saved MISMATCH Excel file: %s", mismatch_path)
-
-        if not not_found.empty:
-            not_found_path = os.path.join(output_dir, f"not_found_{timestamp_str}.xlsx")
-            not_found.to_excel(not_found_path, index=False)
-            logging.info("📊 Saved NOT FOUND Excel file: %s", not_found_path)
+        staging_df = df.copy()
+        staging_df.insert(0, "run_date", timestamp.date())
+        self.load_dataframe(
+            staging_df,
+            table=self.staging_table_id,
+            disposition=bigquery.WriteDisposition.WRITE_TRUNCATE,
+        )
 
         elapsed = time.time() - start
         logging.info("=== ✅ ETL completed in %.2fs ===", elapsed)
 
 
 def main() -> None:
+    if not os.getenv("GOOGLE_APPLICATION_CREDENTIALS"):
+        logging.critical("GOOGLE_APPLICATION_CREDENTIALS must point to a service account key file.")
+        sys.exit(1)
+
     # Load location IDs if file exists
     location_file = os.getenv("ODOO_LOCATIONS_FILE", "odoo_locations.xlsx")
     location_ids = load_location_ids(location_file)
@@ -684,4 +650,3 @@ if __name__ == "__main__":
     except Exception:
         logging.exception("ETL process failed")
         sys.exit(1)
- 
