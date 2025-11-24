@@ -99,7 +99,7 @@ class InventoryETL:
         self.table_id = "comparisons"  # Hardcoded table name
         self.staging_table_id = f"{self.table_id}_staging"
         self.odoo_batch = _load_env_int("ODOO_BATCH", 200)
-        self.store_batch = _load_env_int("STORE_BATCH", 50)  # Reduced to 50 for better stability with chunked errors
+        self.store_batch = _load_env_int("STORE_BATCH", 25)  # Further reduced to 25 for maximum stability
         self.max_workers = _load_env_int("ETL_MAX_WORKERS", 5)
         self.location_ids = location_ids or set()
 
@@ -330,7 +330,9 @@ class InventoryETL:
         all_products: List[Dict] = []
         max_retries = 7  # Increased for chunked encoding errors
         consecutive_failures = 0
-        max_consecutive_failures = 3  # Be more aggressive about stopping
+        max_consecutive_failures = 2  # Stop after 2 consecutive page failures
+        total_failures = 0
+        max_total_failures = 10  # Circuit breaker: stop after 10 total failures
         session = self._create_store_session()
 
         logging.info("📦 Starting fetch of Store products from %s", self.store_api_url)
@@ -365,7 +367,7 @@ class InventoryETL:
                         page += 1
                         consecutive_failures = 0
                         success = True
-                        time.sleep(2)  # Increased delay to reduce server load
+                        time.sleep(5)  # Longer delay to reduce server load
                     else:
                         logging.info("✅ No more store data at page %s", page)
                         # Normal termination
@@ -389,6 +391,13 @@ class InventoryETL:
                     retry_count += 1
                     wait_time = min(5 * (2 ** (retry_count - 1)), 60)  # Exponential: 5, 10, 20, 40, 60...
                     logging.warning("⚠️ Store API chunked error on page %s, attempt %s/%s: %s (waiting %ss)", page, retry_count, max_retries, e, wait_time)
+                    
+                    # Log additional debugging info for chunked errors
+                    if hasattr(e, 'response') and e.response:
+                        logging.warning("   Response status: %s, headers: %s", e.response.status_code if hasattr(e.response, 'status_code') else 'N/A', dict(e.response.headers) if hasattr(e.response, 'headers') else 'N/A')
+                    else:
+                        logging.warning("   No response object available in exception")
+                    
                     time.sleep(wait_time)
                 except requests.exceptions.ConnectionError as e:
                     retry_count += 1
@@ -413,7 +422,12 @@ class InventoryETL:
 
             if not success:
                 consecutive_failures += 1
-                logging.error("❌ Failed to fetch Store page %s after %s attempts", page, max_retries)
+                total_failures += 1
+                logging.error("❌ Failed to fetch Store page %s after %s attempts (total failures: %s)", page, max_retries, total_failures)
+
+                if total_failures >= max_total_failures:
+                    logging.error("🚫 Circuit breaker activated: stopping after %s total failures", total_failures)
+                    break
 
                 if consecutive_failures >= max_consecutive_failures:
                     logging.error("⚠️ Stopping after %s consecutive page failures", consecutive_failures)
@@ -421,7 +435,7 @@ class InventoryETL:
 
                 # Try the next page after a longer pause
                 page += 1
-                time.sleep(5)  # Longer pause before trying next page
+                time.sleep(10)  # Even longer pause before trying next page
 
         # If we exit due to failures, still return whatever we collected
         normalized: List[Dict] = []
@@ -582,7 +596,17 @@ class InventoryETL:
             store_future = executor.submit(self.fetch_store_data)
             
             odoo_data = odoo_future.result()
-            store_data = store_future.result()
+            try:
+                store_data = store_future.result()
+                store_fetch_success = len(store_data) > 0
+            except Exception as e:
+                logging.error("❌ Store API fetch completely failed: %s", e)
+                store_data = []
+                store_fetch_success = False
+
+        if not store_fetch_success:
+            logging.warning("⚠️ Store API unavailable - proceeding with Odoo data only")
+            # All products will be marked as NOT FOUND IN STORE
 
         # Fetch detailed stock by location for NOT FOUND analysis
         logging.info("📍 Fetching detailed stock by location...")
